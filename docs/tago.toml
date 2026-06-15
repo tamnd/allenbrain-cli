@@ -1,0 +1,10 @@
+title       = "allenbrain"
+baseURL     = "https://allenbrain-cli.tamnd.com/"
+description = "A command line for allenbrain."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/allenbrain-cli"
