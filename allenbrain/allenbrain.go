@@ -1,38 +1,40 @@
 // Package allenbrain is the library behind the allenbrain command line:
-// the HTTP client, request shaping, and the typed data models for allenbrain.
+// the HTTP client, request shaping, and typed data models for the Allen
+// Brain Atlas public API (api.brain-map.org/api/v2).
 //
 // The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// User-Agent, paces requests so a busy session stays polite, and retries
+// the transient failures (429 and 5xx) that any public API throws under load.
 package allenbrain
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
+	"net/url"
+	"strconv"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to allenbrain. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "allenbrain/dev (+https://github.com/tamnd/allenbrain-cli)"
+// DefaultUserAgent identifies the client to Allen Brain Atlas.
+const DefaultUserAgent = "allenbrain-cli/dev (+https://github.com/tamnd/allenbrain-cli)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at allenbrain.com; change it once you
-// know the real endpoints you want to read.
-const Host = "allenbrain.com"
+// Host is the site this client talks to.
+const Host = "api.brain-map.org"
 
 // BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+const BaseURL = "http://api.brain-map.org/api/v2"
 
-// Client talks to allenbrain over HTTP.
+// BrainURL is the human-facing site URL for gene pages.
+const BrainURL = "https://mouse.brain-map.org"
+
+// Client talks to the Allen Brain Atlas API over HTTP.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
+	BaseURL   string
 	// Rate is the minimum gap between requests. Zero means no pacing.
 	Rate    time.Duration
 	Retries int
@@ -40,21 +42,22 @@ type Client struct {
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with sensible defaults: a 15s timeout, a 300ms
+// minimum gap between requests, and three retries on transient errors.
 func NewClient() *Client {
 	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+		HTTP:      &http.Client{Timeout: 15 * time.Second},
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		BaseURL:   BaseURL,
+		Rate:      300 * time.Millisecond,
+		Retries:   3,
 	}
 }
 
 // Get fetches url and returns the response body. It paces and retries according
 // to the client's settings. The caller owns nothing extra; the body is read
 // fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+func (c *Client) Get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.Retries; attempt++ {
 		if attempt > 0 {
@@ -64,7 +67,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,16 +76,17 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) (body []byte, retry bool, err error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
 	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
@@ -123,78 +127,163 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on allenbrain.com. It is a stand-in for the typed records you
-// will model from the real allenbrain endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `allenbrain cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// --- wire types (unexported) ---
+
+type wireResponse[T any] struct {
+	Success   bool `json:"success"`
+	TotalRows int  `json:"total_rows"`
+	Msg       []T  `json:"msg"`
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
+type wireGene struct {
+	ID       int    `json:"id"`
+	Acronym  string `json:"acronym"`
+	Name     string `json:"name"`
+	EntrezID int    `json:"entrez_id"`
+}
+
+type wireAtlas struct {
+	ID        int    `json:"id"`
+	Name      string `json:"name"`
+	ImageType string `json:"image_type"`
+}
+
+type wireDataset struct {
+	ID           int         `json:"id"`
+	PlaneSection int         `json:"plane_of_section_id"`
+	RefSpace     int         `json:"reference_space_id"`
+	Genes        []wireGene  `json:"genes"`
+}
+
+// --- public types ---
+
+// Gene is one gene entry from the Allen Brain Atlas.
+type Gene struct {
+	ID      int    `json:"id" kit:"id"`
+	Acronym string `json:"acronym"`
+	Name    string `json:"name"`
+	EntrezID int   `json:"entrez_id,omitempty"`
+}
+
+// Atlas is one reference atlas from the Allen Brain Atlas.
+type Atlas struct {
+	ID        int    `json:"id" kit:"id"`
+	Name      string `json:"name"`
+	ImageType string `json:"image_type,omitempty"`
+}
+
+// Dataset is one section dataset from the Allen Brain Atlas.
+type Dataset struct {
+	ID           int    `json:"id" kit:"id"`
+	PlaneSection int    `json:"plane_section_id,omitempty"`
+	Genes        []Gene `json:"genes,omitempty"`
+}
+
+// --- API methods ---
+
+// Genes lists genes with pagination.
+func (c *Client) Genes(ctx context.Context, limit, start int) ([]Gene, error) {
+	u := c.BaseURL + "/data/Gene/query.json?" +
+		"num_rows=" + strconv.Itoa(limit) +
+		"&start_row=" + strconv.Itoa(start)
+	body, err := c.Get(ctx, u)
 	if err != nil {
 		return nil, err
 	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
+	var resp wireResponse[wireGene]
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode genes: %w", err)
+	}
+	return toGenes(resp.Msg), nil
 }
 
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
+// SearchGenes searches genes by name using the criteria filter.
+func (c *Client) SearchGenes(ctx context.Context, query string, limit int) ([]Gene, error) {
+	criteria := "[name$il'*" + query + "*']"
+	u := c.BaseURL + "/data/Gene/query.json?" +
+		"criteria=" + url.QueryEscape(criteria) +
+		"&num_rows=" + strconv.Itoa(limit)
+	body, err := c.Get(ctx, u)
 	if err != nil {
 		return nil, err
 	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
+	var resp wireResponse[wireGene]
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode search genes: %w", err)
 	}
-	return out, nil
+	return toGenes(resp.Msg), nil
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
+// Atlases lists all reference atlases.
+func (c *Client) Atlases(ctx context.Context) ([]Atlas, error) {
+	u := c.BaseURL + "/data/Atlas/query.json?num_rows=100"
+	body, err := c.Get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var resp wireResponse[wireAtlas]
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode atlases: %w", err)
+	}
+	return toAtlases(resp.Msg), nil
+}
 
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
+// Datasets lists section datasets with pagination.
+func (c *Client) Datasets(ctx context.Context, limit, start int) ([]Dataset, error) {
+	u := c.BaseURL + "/data/SectionDataSet/query.json?" +
+		"criteria=products[abbreviation$eq'Mouse']" +
+		"&num_rows=" + strconv.Itoa(limit) +
+		"&start_row=" + strconv.Itoa(start) +
+		"&include=genes"
+	body, err := c.Get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var resp wireResponse[wireDataset]
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode datasets: %w", err)
+	}
+	return toDatasets(resp.Msg), nil
+}
+
+// --- converters ---
+
+func toGenes(ws []wireGene) []Gene {
+	out := make([]Gene, len(ws))
+	for i, w := range ws {
+		out[i] = Gene{
+			ID:       w.ID,
+			Acronym:  w.Acronym,
+			Name:     w.Name,
+			EntrezID: w.EntrezID,
 		}
 	}
 	return out
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+func toAtlases(ws []wireAtlas) []Atlas {
+	out := make([]Atlas, len(ws))
+	for i, w := range ws {
+		out[i] = Atlas{
+			ID:        w.ID,
+			Name:      w.Name,
+			ImageType: w.ImageType,
+		}
 	}
-	return s
+	return out
+}
+
+func toDatasets(ws []wireDataset) []Dataset {
+	out := make([]Dataset, len(ws))
+	for i, w := range ws {
+		d := Dataset{
+			ID:           w.ID,
+			PlaneSection: w.PlaneSection,
+		}
+		if len(w.Genes) > 0 {
+			d.Genes = toGenes(w.Genes)
+		}
+		out[i] = d
+	}
+	return out
 }
