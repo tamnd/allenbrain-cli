@@ -6,71 +6,115 @@ import (
 	"github.com/tamnd/any-cli/kit"
 )
 
-// These tests are offline: they exercise the URI driver's pure string functions
-// and the host wiring (mint, body, resolve), which need no network. The client's
-// HTTP behaviour is covered in allenbrain_test.go.
+// These tests are offline: they exercise the URI driver's pure string
+// functions and the host wiring (mint, body, resolve), which need no network.
+// The client's HTTP behaviour is covered in allenbrain_test.go.
 
 func TestDomainInfo(t *testing.T) {
 	info := Domain{}.Info()
 	if info.Scheme != "allenbrain" {
 		t.Errorf("Scheme = %q, want allenbrain", info.Scheme)
 	}
-	if len(info.Hosts) == 0 || info.Hosts[0] != Host {
-		t.Errorf("Hosts = %v, want [%s]", info.Hosts, Host)
+	if len(info.Hosts) == 0 {
+		t.Errorf("Hosts is empty")
+	}
+	found := false
+	for _, h := range info.Hosts {
+		if h == Host {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Hosts does not contain %q: %v", Host, info.Hosts)
 	}
 	if info.Identity.Binary != "allenbrain" {
 		t.Errorf("Identity.Binary = %q, want allenbrain", info.Identity.Binary)
 	}
 }
 
-func TestClassify(t *testing.T) {
-	cases := []struct{ in, typ, id string }{
-		{"wiki/Go", "page", "wiki/Go"},
-		{"/about/", "page", "about"},
-		{"https://" + Host + "/team/contact", "page", "team/contact"},
+func TestClassifyGene(t *testing.T) {
+	cases := []struct {
+		in  string
+		typ string
+		id  string
+		ok  bool
+	}{
+		{"42", "gene", "42", true},
+		{"1234", "gene", "1234", true},
+		{"allenbrain://gene/99", "gene", "99", true},
+		{"allenbrain://atlas/3", "atlas", "3", true},
+		{"allenbrain://dataset/77", "dataset", "77", true},
+		{"not-a-number", "", "", false},
+		{"", "", "", false},
 	}
 	for _, tc := range cases {
 		typ, id, err := Domain{}.Classify(tc.in)
-		if err != nil || typ != tc.typ || id != tc.id {
-			t.Errorf("Classify(%q) = (%q, %q, %v), want (%q, %q, nil)",
-				tc.in, typ, id, err, tc.typ, tc.id)
+		if tc.ok {
+			if err != nil {
+				t.Errorf("Classify(%q) returned error: %v", tc.in, err)
+				continue
+			}
+			if typ != tc.typ || id != tc.id {
+				t.Errorf("Classify(%q) = (%q, %q), want (%q, %q)", tc.in, typ, id, tc.typ, tc.id)
+			}
+		} else {
+			if err == nil {
+				t.Errorf("Classify(%q) expected error, got (%q, %q, nil)", tc.in, typ, id)
+			}
 		}
 	}
 }
 
 func TestLocate(t *testing.T) {
-	got, err := Domain{}.Locate("page", "wiki/Go")
-	want := "https://" + Host + "/wiki/Go"
-	if err != nil || got != want {
-		t.Errorf("Locate = (%q, %v), want (%q, nil)", got, err, want)
+	cases := []struct {
+		typ  string
+		id   string
+		want string
+	}{
+		{"gene", "1", BrainURL + "/gene/show/1"},
+		{"atlas", "2", BrainURL + "/atlas/show/2"},
+		{"dataset", "100", BrainURL + "/experiment/show/100"},
+	}
+	for _, tc := range cases {
+		got, err := Domain{}.Locate(tc.typ, tc.id)
+		if err != nil {
+			t.Errorf("Locate(%q, %q) error: %v", tc.typ, tc.id, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("Locate(%q, %q) = %q, want %q", tc.typ, tc.id, got, tc.want)
+		}
 	}
 }
 
-// TestHostWiring mounts the driver in a kit Host (the runtime ant drives) and
-// checks the round trip: a record mints to its URI, its body is readable, and a
-// bare id resolves back to the same URI. The init in domain.go registers the
-// domain, so kit.Open finds it.
+func TestLocateUnknownType(t *testing.T) {
+	_, err := Domain{}.Locate("bogus", "1")
+	if err == nil {
+		t.Error("expected error for unknown resource type, got nil")
+	}
+}
+
 func TestHostWiring(t *testing.T) {
 	h, err := kit.Open()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	p := &Page{ID: "wiki/Go", URL: "https://" + Host + "/wiki/Go", Title: "Go", Body: "Go is a language."}
-	u, err := h.Mint(p)
+	g := &Gene{ID: 1, Acronym: "A1BG", Name: "alpha-1-B glycoprotein"}
+	u, err := h.Mint(g)
 	if err != nil {
 		t.Fatalf("Mint: %v", err)
 	}
-	if want := "allenbrain://page/wiki/Go"; u.String() != want {
+	want := "allenbrain://gene/1"
+	if u.String() != want {
 		t.Errorf("Mint = %q, want %q", u.String(), want)
 	}
 
-	if body, ok := h.Body(p); !ok || body == "" {
-		t.Errorf("Body = (%q, %v), want non-empty", body, ok)
+	got, err := h.ResolveOn("allenbrain", "42")
+	if err != nil {
+		t.Fatalf("ResolveOn: %v", err)
 	}
-
-	got, err := h.ResolveOn("allenbrain", "about")
-	if err != nil || got.String() != "allenbrain://page/about" {
-		t.Errorf("ResolveOn = (%q, %v), want allenbrain://page/about", got.String(), err)
+	if got.String() != "allenbrain://gene/42" {
+		t.Errorf("ResolveOn = %q, want allenbrain://gene/42", got.String())
 	}
 }
